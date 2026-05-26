@@ -1,0 +1,9 @@
+# 小型实例 4U8G 配置
+name: "小型 4U8G"
+instance_type: ecs.sn1ne.xlarge
+spot_strategy: SpotAsPriceGo
+spot_duration: 0
+spot_interruption_behavior: Stop
+internet_max_bandwidth_out: 100
+internet_charge_type: PayByTraffic
+disk_size: 35
