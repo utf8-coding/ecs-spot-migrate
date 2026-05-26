@@ -398,7 +398,9 @@ class AliClient:
         req.set_ZoneId(params.get("ZoneId", ""))
         req.set_InstanceChargeType("PostPaid")
         req.set_Amount(1)
-        req.set_PasswordInherit(True)
+        # 密钥对和密码互斥，有密钥对时不设 PasswordInherit
+        if not params.get("KeyPairName"):
+            req.set_PasswordInherit(True)
 
         # 抢占式参数
         spot_strategy = params.get("SpotStrategy", "SpotAsPriceGo")
@@ -1425,7 +1427,7 @@ def main():
         log("用户取消。断点已保留, 可恢复。")
         sys.exit(0)
 
-    # --- 创建新实例 (含 NoStock 自动搜索替代规格) ---
+    # --- 创建新实例 (含缺货自动搜索替代规格) ---
     if checkpoint in ("", CK_IMAGE_DONE, CK_INSTANCE_CREATING, CK_INSTANCE_DONE, CK_DONE):
         csv_write_row(run_id, CK_INSTANCE_CREATING, snapshot_id=snapshot_id,
                       image_id=image_id, source_instance_id=src_id,
@@ -1441,23 +1443,37 @@ def main():
                 new_instance_id = step_create_instance(client, merged_config, csv_row or {})
             except Exception as e:
                 err = str(e)
-                if ("NoStock" in err or "out of stock" in err.lower() or
-                    "OperationDenied" in err or "not available" in err.lower()):
+                if any(kw in err for kw in ("NoStock", "out of stock", "OperationDenied",
+                                             "not available", "InvalidResourceType",
+                                             "not exists")):
                     tried_types.append(inst_type)
-                    log(f"\n  错误: {inst_type} 在 {zone_id} 无库存 (已尝试 {len(tried_types)} 个)")
+                    log(f"\n  缺货: {inst_type} 在 {zone_id} 无库存 (已尝试 {len(tried_types)} 个)")
+                    log(f"  原始错误: {err.split('RequestID:')[0].strip()}")
                     specs = client.get_instance_type_specs(inst_type)
                     cpu = specs["Cpu"] if specs else 52
                     mem = specs["Memory"] if specs else 96
                     log(f"  搜索 {cpu}C{mem}G 替代规格...")
                     alts = client.find_similar_types(cpu, mem, exclude_type=inst_type)
-                    # 再排除所有已尝试的
                     alts = [a for a in alts if a["InstanceType"] not in tried_types]
                     if not alts:
                         log(f"\n  所有同配 ({cpu}C{mem}G) 规格均已尝试, 均无库存。")
                         log(f"  建议: 1) 换可用区 2) 换更小规格 3) 稍后重试 (spot 池动态变化)")
+                        # 清理已创建的快照和镜像
+                        log("  清理已创建的快照和镜像...")
+                        if image_id:
+                            try:
+                                client.delete_image(image_id, force=True)
+                                log(f"    已删除镜像 {image_id}")
+                            except Exception as ex:
+                                log(f"    删除镜像失败: {ex}")
+                        if snapshot_id:
+                            try:
+                                client.delete_snapshot(snapshot_id)
+                                log(f"    已删除快照 {snapshot_id}")
+                            except Exception as ex:
+                                log(f"    删除快照失败: {ex}")
                         sys.exit(1)
 
-                    # 批量查报价
                     prices = client.query_spot_price_batch(
                         [a["InstanceType"] for a in alts], zone_id)
 
@@ -1479,7 +1495,19 @@ def main():
 
                     ans = input(f"\n  选择替代规格 (1-{len(alts)}, q=退出): ").strip().lower()
                     if ans in ("q", "quit", "exit"):
-                        log("用户退出。")
+                        log("用户取消, 清理已创建的快照和镜像...")
+                        if image_id:
+                            try:
+                                client.delete_image(image_id, force=True)
+                                log(f"  已删除镜像 {image_id}")
+                            except Exception as ex:
+                                log(f"  删除镜像失败: {ex}")
+                        if snapshot_id:
+                            try:
+                                client.delete_snapshot(snapshot_id)
+                                log(f"  已删除快照 {snapshot_id}")
+                            except Exception as ex:
+                                log(f"  删除快照失败: {ex}")
                         sys.exit(0)
                     try:
                         choice = int(ans)
