@@ -41,6 +41,7 @@ from aliyunsdkecs.request.v20140526 import (
     DeleteInstanceRequest,
     DeleteSnapshotRequest,
     DescribeImagesRequest,
+    DescribeInstanceTypesRequest,
     DescribeInstancesRequest,
     DescribeSnapshotsRequest,
     RunInstancesRequest,
@@ -322,6 +323,68 @@ class AliClient:
         # 取最新一条
         prices.sort(key=lambda p: p.get("Timestamp", ""), reverse=True)
         return prices[0]
+
+    def get_instance_type_specs(self, instance_type: str) -> Optional[Dict[str, int]]:
+        """查询实例规格的 CPU 核数和内存大小"""
+        req = DescribeInstanceTypesRequest.DescribeInstanceTypesRequest()
+        req.set_InstanceTypess([instance_type])
+        req.set_MaxResults(1)
+        resp = self._call(req)
+        types = resp.get("InstanceTypes", {}).get("InstanceType", [])
+        if types:
+            t = types[0]
+            return {"Cpu": int(t.get("CpuCoreCount", 0)), "Memory": int(t.get("MemorySize", 0))}
+        return None
+
+    def find_similar_types(self, cpu: int, memory_gib: int,
+                           exclude_type: str = "") -> List[Dict[str, Any]]:
+        """查找同 CPU + 内存的实例规格，排除指定规格（无匹配时放宽 ±2C ±8G）"""
+        results = self._query_types(cpu, cpu, memory_gib, memory_gib, exclude_type)
+        if not results:
+            # 放宽: CPU ±2, 内存 ±8
+            results = self._query_types(
+                max(1, cpu - 2), cpu + 2,
+                max(1, memory_gib - 8), memory_gib + 8,
+                exclude_type
+            )
+        return results
+
+    def _query_types(self, cpu_min, cpu_max, mem_min, mem_max, exclude_type) -> List[Dict[str, Any]]:
+        req = DescribeInstanceTypesRequest.DescribeInstanceTypesRequest()
+        req.set_MinimumCpuCoreCount(cpu_min)
+        req.set_MaximumCpuCoreCount(cpu_max)
+        req.set_MinimumMemorySize(mem_min)
+        req.set_MaximumMemorySize(mem_max)
+        req.set_MaxResults(100)
+        resp = self._call(req)
+        types = resp.get("InstanceTypes", {}).get("InstanceType", [])
+        results = []
+        for t in types:
+            tid = t.get("InstanceTypeId", "")
+            if tid == exclude_type:
+                continue
+            # 只保留和 region 兼容的（API 以返回为信）
+            results.append({
+                "InstanceType": tid,
+                "CpuCoreCount": int(t.get("CpuCoreCount", 0)),
+                "MemorySize": int(t.get("MemorySize", 0)),
+                "Family": t.get("InstanceTypeFamily", ""),
+                "Category": t.get("InstanceCategory", ""),
+            })
+        return results
+
+    def query_spot_price_batch(self, instance_types: List[str],
+                                zone_id: str) -> Dict[str, Optional[Dict]]:
+        """批量查询多个规格的抢占式报价"""
+        from aliyunsdkecs.request.v20140526 import DescribeSpotPriceHistoryRequest
+        prices = {}
+        for itype in instance_types:
+            try:
+                pd = self.query_spot_price(itype, zone_id)
+                prices[itype] = pd
+            except Exception:
+                prices[itype] = None
+        return prices
 
     # ----- Instance -----------------------------------------------------
 
@@ -936,9 +999,37 @@ def step_create_instance(client: AliClient, merged_config: Dict,
             log(f"    实例状态异常, 重新创建")
 
     log("  创建新抢占式实例...")
-    niid = client.run_instances(merged_config)
-    log(f"  新实例创建请求已发送: {niid}")
-    return niid
+
+    # 系统盘类型 fallback: c8a 等新代系不支持 cloud_efficiency
+    sys_cat = merged_config.get("SystemDisk.Category", "")
+    fallbacks = ["cloud_essd", "cloud_ssd", "cloud_efficiency",
+                 "cloud_auto", "cloud_essd_entry"]
+    # 把用户指定的类型排到最前面
+    if sys_cat and sys_cat in fallbacks:
+        fallbacks.remove(sys_cat)
+        fallbacks.insert(0, sys_cat)
+
+    last_err = None
+    for fb in fallbacks:
+        merged_config["SystemDisk.Category"] = fb
+        try:
+            niid = client.run_instances(merged_config)
+            if niid:
+                log(f"  新实例创建请求已发送: {niid} (盘类型 {fb})")
+                return niid
+            # API 返回空 — 非盘类型问题, 直接返回空
+            log(f"  警告: API 返回空实例 ID (盘类型 {fb})")
+            return ""
+        except Exception as e:
+            err = str(e)
+            if "InvalidSystemDiskCategory" in err or "SystemDisk.Category" in err:
+                last_err = e
+                continue
+            raise
+    # 所有盘类型都失败
+    if last_err:
+        raise last_err
+    return ""
 
 
 def step_cleanup(client: AliClient, source_instance_id: str,
@@ -1334,30 +1425,96 @@ def main():
         log("用户取消。断点已保留, 可恢复。")
         sys.exit(0)
 
-    # --- 创建新实例 ---
+    # --- 创建新实例 (含 NoStock 自动搜索替代规格) ---
     if checkpoint in ("", CK_IMAGE_DONE, CK_INSTANCE_CREATING, CK_INSTANCE_DONE, CK_DONE):
         csv_write_row(run_id, CK_INSTANCE_CREATING, snapshot_id=snapshot_id,
                       image_id=image_id, source_instance_id=src_id,
                       source_disk_id=source_disk_id, yaml_config=yaml_fname,
                       resource_name=resource_name)
-        new_instance_id = step_create_instance(client, merged_config, csv_row or {})
-        if new_instance_id:
-            csv_write_row(run_id, CK_INSTANCE_CREATING, snapshot_id=snapshot_id,
-                          image_id=image_id, source_instance_id=src_id,
-                          source_disk_id=source_disk_id, yaml_config=yaml_fname,
-                           new_instance_id=new_instance_id, resource_name=resource_name)
-            log("  等待实例启动 (请勿中断)...")
-            if not client.poll_instance_running(new_instance_id):
-                log("实例未成功启动, 退出。断点已保存。")
+
+        inst_type = merged_config.get("InstanceType", "")
+        zone_id = merged_config.get("ZoneId", "")
+        tried_types: List[str] = []  # 已尝试且无库存的规格
+
+        while True:
+            try:
+                new_instance_id = step_create_instance(client, merged_config, csv_row or {})
+            except Exception as e:
+                err = str(e)
+                if ("NoStock" in err or "out of stock" in err.lower() or
+                    "OperationDenied" in err or "not available" in err.lower()):
+                    tried_types.append(inst_type)
+                    log(f"\n  错误: {inst_type} 在 {zone_id} 无库存 (已尝试 {len(tried_types)} 个)")
+                    specs = client.get_instance_type_specs(inst_type)
+                    cpu = specs["Cpu"] if specs else 52
+                    mem = specs["Memory"] if specs else 96
+                    log(f"  搜索 {cpu}C{mem}G 替代规格...")
+                    alts = client.find_similar_types(cpu, mem, exclude_type=inst_type)
+                    # 再排除所有已尝试的
+                    alts = [a for a in alts if a["InstanceType"] not in tried_types]
+                    if not alts:
+                        log(f"\n  所有同配 ({cpu}C{mem}G) 规格均已尝试, 均无库存。")
+                        log(f"  建议: 1) 换可用区 2) 换更小规格 3) 稍后重试 (spot 池动态变化)")
+                        sys.exit(1)
+
+                    # 批量查报价
+                    prices = client.query_spot_price_batch(
+                        [a["InstanceType"] for a in alts], zone_id)
+
+                    print(f"\n  同配 ({cpu}C{mem}G) 替代规格 ({len(alts)} 个):\n")
+                    print(f"{'#':<4} {'规格':<24} {'CPU':>4} {'内存':>6} {'代系':<10} {'家族':<18} {'spot价':>10} {'原价':>10} {'折扣':>8}")
+                    print("-" * 100)
+                    for i, alt in enumerate(alts, 1):
+                        atype = alt["InstanceType"]
+                        alt_cpu = alt.get("CpuCoreCount", "?")
+                        alt_mem = alt.get("MemorySize", "?")
+                        pd = prices.get(atype)
+                        if pd:
+                            sp = pd.get("SpotPrice", 0)
+                            op = pd.get("OriginPrice", 0)
+                            disc = (1 - sp / (op or 1)) * 100
+                            print(f"{i:<4} {atype:<24} {alt_cpu:>4} {alt_mem:>5}G {alt['Category']:<10} {alt['Family']:<18} {sp:>8.3f}元 {op:>8.3f}元 {disc:>6.0f}%")
+                        else:
+                            print(f"{i:<4} {atype:<24} {alt_cpu:>4} {alt_mem:>5}G {alt['Category']:<10} {alt['Family']:<18} {'无报价':>27}")
+
+                    ans = input(f"\n  选择替代规格 (1-{len(alts)}, q=退出): ").strip().lower()
+                    if ans in ("q", "quit", "exit"):
+                        log("用户退出。")
+                        sys.exit(0)
+                    try:
+                        choice = int(ans)
+                        if 1 <= choice <= len(alts):
+                            new_type = alts[choice - 1]["InstanceType"]
+                            merged_config["InstanceType"] = new_type
+                            inst_type = new_type
+                            log(f"  改用规格: {new_type}\n")
+                            continue
+                    except ValueError:
+                        pass
+                    print("  请输入有效编号。")
+                    continue
+
+                else:
+                    raise
+
+            if new_instance_id:
+                csv_write_row(run_id, CK_INSTANCE_CREATING, snapshot_id=snapshot_id,
+                              image_id=image_id, source_instance_id=src_id,
+                              source_disk_id=source_disk_id, yaml_config=yaml_fname,
+                              new_instance_id=new_instance_id, resource_name=resource_name)
+                log("  等待实例启动 (请勿中断)...")
+                if not client.poll_instance_running(new_instance_id):
+                    log("实例未成功启动, 退出。断点已保存。")
+                    sys.exit(1)
+                csv_write_row(run_id, CK_INSTANCE_DONE, snapshot_id=snapshot_id,
+                              image_id=image_id, source_instance_id=src_id,
+                              source_disk_id=source_disk_id, yaml_config=yaml_fname,
+                              new_instance_id=new_instance_id, resource_name=resource_name)
+                log(f"  新实例已 Running: {new_instance_id}")
+                break
+            else:
+                log("实例创建失败, 退出。")
                 sys.exit(1)
-            csv_write_row(run_id, CK_INSTANCE_DONE, snapshot_id=snapshot_id,
-                          image_id=image_id, source_instance_id=src_id,
-                          source_disk_id=source_disk_id, yaml_config=yaml_fname,
-                          new_instance_id=new_instance_id, resource_name=resource_name)
-            log(f"  新实例已 Running: {new_instance_id}")
-        else:
-            log("实例创建失败, 退出。")
-            sys.exit(1)
 
     # --- 清理旧资源 ---
     step_cleanup(client, src_id, snapshot_id, image_id, run_id)

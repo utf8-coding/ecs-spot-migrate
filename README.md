@@ -59,7 +59,7 @@ python3 migrate_spot_instance.py --list
 python3 migrate_spot_instance.py --price
 
 # 查询指定规格 + 可用区的抢占式报价
-python3 migrate_spot_instance.py --price -t ecs.c6e.13xlarge -z cn-shenzhen-f
+python3 migrate_spot_instance.py --price -t ecs.c8a.12xlarge -z cn-shenzhen-f
 ```
 
 ## 执行流程

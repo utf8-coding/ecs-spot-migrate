@@ -1,9 +1,10 @@
-# 大型实例 52U96G 配置
-name: "大型 52U96G"
-instance_type: ecs.c6e.13xlarge
+# 大型实例 48C96G 配置
+name: "大型 48C96G"
+instance_type: ecs.c8a.12xlarge
 spot_strategy: SpotAsPriceGo
 spot_duration: 0
 spot_interruption_behavior: Stop
 internet_max_bandwidth_out: 100
 internet_charge_type: PayByTraffic
 disk_size: 35
+system_disk_category: cloud_essd
